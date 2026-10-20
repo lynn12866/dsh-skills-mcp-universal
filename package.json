@@ -1,0 +1,87 @@
+{
+  "name": "dsh-skills-mcp-universal",
+  "version": "0.5.1",
+  "description": "Skills and MCP management for DeepSeek Harness Web and Desktop",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lynn12866/dsh-skills-mcp-universal.git"
+  },
+  "homepage": "https://github.com/lynn12866/dsh-skills-mcp-universal#readme",
+  "bugs": {
+    "url": "https://github.com/lynn12866/dsh-skills-mcp-universal/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./client": "./dist/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/src",
+    "dist/client.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md",
+    "CONTRIBUTING.md",
+    "VALIDATION.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.4 <5.0.0",
+    "@deepseek-ai/dsh-mcp-client": ">=0.2.0-rc.2 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-mcp-client": {
+      "optional": true
+    },
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node dist/scripts/build-client.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && node --test dist/test/*.test.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "pnpm typecheck && pnpm format:check && pnpm test && node dist/scripts/check.js",
+    "prepack": "pnpm check",
+    "release": "node --experimental-strip-types scripts/release.ts",
+    "release:dry-run": "node --experimental-strip-types scripts/release.ts --dry-run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "prettier": "^3.9.10",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@11.25.0",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

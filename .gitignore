@@ -1,0 +1,9 @@
+node_modules/
+.pnpm-store/
+dist/
+artifacts/
+coverage/
+*.tsbuildinfo
+*.tgz
+npm-debug.log*
+pnpm-debug.log*
