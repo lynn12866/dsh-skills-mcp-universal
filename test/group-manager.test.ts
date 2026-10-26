@@ -1,6 +1,15 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdtemp,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GroupManager } from '../src/group-manager.js';
@@ -439,4 +448,325 @@ test('same instructions with different resources remain a real conflict and neve
   await assert.rejects(manager.toggle(group.id, true), /different Skill/);
   assert.equal(await readFile(asset, 'utf8'), 'workspace-specific asset');
   assert.equal(await readFile(manager.store.file, 'utf8'), before);
+});
+
+test('catalog loads available workspaces and preserves groups assigned to deleted directories', async (t) => {
+  const { a, b, manager, api, entries } = await fixture(t);
+  const x = await entries('available-catalog');
+  const group = await manager.save({
+    name: 'available-catalog',
+    members: x.members,
+    workspaces: [a, b],
+  });
+  await manager.toggle(group.id, true);
+  const before = await manager.store.read();
+  await rm(b, { recursive: true });
+
+  const catalog = await api.groups({ workspaces: [a, b] });
+  assert.equal(catalog.workspaceRoots[a], a);
+  assert.equal(catalog.workspaceRoots[b], undefined);
+  assert.ok(catalog.unavailableWorkspaces.includes(b));
+  assert.equal(catalog.items.find((item) => item.id === group.id)?.enabled, true);
+  assert.deepEqual(catalog.items.find((item) => item.id === group.id)?.workspaces, [a, b]);
+  assert.deepEqual(await manager.store.read(), before);
+  assert.ok((await api.skills({})).some((item) => item.path === x.path));
+  assert.ok((await api.servers({})).some((item) => item.name === 'available-catalog'));
+  await assert.rejects(access(b));
+});
+
+test('unavailable historical targets neither recreate directories nor alter an ancestor Git workspace', async (t) => {
+  const { root, a, manager, skills, mcp, entries } = await fixture(t);
+  const ancestor = join(root, 'archive');
+  const deleted = join(ancestor, 'deleted-workspace');
+  await mkdir(deleted, { recursive: true });
+  const x = await entries('historical-target');
+  const stale = await manager.save({
+    name: 'historical-target',
+    members: x.members,
+    workspaces: [deleted],
+  });
+  await manager.toggle(stale.id, true);
+  await rm(deleted, { recursive: true });
+  await mkdir(join(ancestor, '.git'));
+  const sentinel = join(ancestor, '.dsh/skills/ancestor-only/SKILL.md');
+  const raw = '---\nname: ancestor-only\ndescription: ancestor\n---\nKeep this enabled.\n';
+  await mkdir(dirnameFor(sentinel), { recursive: true });
+  await writeFile(sentinel, raw);
+
+  const reopened = new GroupManager(skills, mcp, mcp.profileDir);
+  await reopened.register([]);
+  assert.equal(await readFile(sentinel, 'utf8'), raw);
+  await assert.rejects(access(deleted));
+  await assert.rejects(access(join(ancestor, '.dsh/skills/historical-target')));
+  const preserved = (await reopened.list()).find((group) => group.id === stale.id);
+  assert.equal(preserved?.enabled, true);
+  assert.deepEqual(preserved?.workspaces, [deleted]);
+
+  const healthy = await reopened.save({
+    name: 'healthy-target',
+    members: x.members,
+    workspaces: [a],
+  });
+  await reopened.toggle(healthy.id, true);
+  assert.equal((await mcp.effective(a)).length, 1);
+  await reopened.toggle(healthy.id, false);
+  assert.deepEqual(await mcp.effective(a), []);
+  await reopened.remove(healthy.id);
+  await reopened.toggle(stale.id, false);
+  assert.equal((await reopened.list()).find((group) => group.id === stale.id)?.enabled, false);
+  await reopened.remove(stale.id);
+  assert.deepEqual(await reopened.list(), []);
+  assert.equal(await readFile(sentinel, 'utf8'), raw);
+  await assert.rejects(access(deleted));
+});
+
+test('restoring an unavailable workspace retries pending migration and enabled Skill deployment', async (t) => {
+  const { root, b, manager, skills, mcp, local, entries } = await fixture(t);
+  const x = await entries('restored-deploy');
+  const active = await manager.save({
+    name: 'restored-deploy',
+    members: x.members,
+    workspaces: [b],
+  });
+  await manager.toggle(active.id, true);
+  await mcp.save({ name: 'restored-legacy', command: 'node' }, undefined, {
+    scope: 'workspace',
+    cwd: b,
+  });
+  const legacy = new Groups(skills, mcp, mcp.profileDir);
+  await legacy.save(
+    { name: 'pending-local', members: [{ kind: 'mcp', name: 'restored-legacy' }] },
+    { scope: 'workspace', cwd: b },
+  );
+  const legacyFile = join(b, '.dsh/skills-mcp-groups.json');
+  await manager.store.update((data) => {
+    data.migrated = data.migrated.filter((file) => file !== legacyFile);
+  });
+  const held = join(root, 'held-workspace');
+  await rename(b, held);
+  await rm(join(held, '.dsh/skills/restored-deploy'), { recursive: true });
+
+  const reopened = new GroupManager(skills, mcp, mcp.profileDir);
+  await reopened.register([]);
+  assert.equal((await reopened.store.read()).migrated.includes(legacyFile), false);
+  assert.equal(
+    (await reopened.list()).some((group) => group.name === 'pending-local'),
+    false,
+  );
+  assert.equal((await reopened.list()).find((group) => group.id === active.id)?.enabled, true);
+  await assert.rejects(access(b));
+
+  await rename(held, b);
+  await reopened.register([b]);
+  const pending = (await reopened.list()).filter((group) => group.name === 'pending-local');
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].enabled, false);
+  assert.deepEqual(pending[0].members, [{ kind: 'mcp', name: 'restored-legacy', cwd: b }]);
+  assert.equal((await skills.read(local(b, 'restored-deploy'), b)).modelEnabled, true);
+  assert.equal(
+    await readFile(join(local(b, 'restored-deploy'), '../assets/data.txt'), 'utf8'),
+    'asset',
+  );
+  await reopened.register([b]);
+  assert.equal((await reopened.list()).filter((group) => group.name === 'pending-local').length, 1);
+  assert.equal(
+    (await reopened.store.read()).migrated.filter((file) => file === legacyFile).length,
+    1,
+  );
+});
+
+test('legacy global assignments retain missing targets until their directories become available', async (t) => {
+  const { root, a, skills, mcp } = await fixture(t);
+  const unavailable = join(root, 'offline-assignment');
+  await mcp.save({ name: 'assigned-legacy', command: 'node' });
+  const legacy = new Groups(skills, mcp, mcp.profileDir);
+  const old = await legacy.save({
+    name: 'assigned-legacy',
+    members: [{ kind: 'mcp', name: 'assigned-legacy' }],
+  });
+  await writeFile(
+    join(mcp.profileDir, 'skills-mcp-scenes.json'),
+    JSON.stringify({
+      version: 1,
+      entries: [{ id: old.id, scope: 'global', workspaces: [a, unavailable] }],
+    }),
+  );
+  await rm(join(mcp.profileDir, 'skills-mcp-group-state.json'));
+
+  const upgraded = new GroupManager(skills, mcp, mcp.profileDir);
+  const catalog = await upgraded.catalog([a, unavailable]);
+  assert.equal(catalog.items.length, 1);
+  assert.deepEqual(catalog.items[0].workspaces, [a, unavailable]);
+  assert.equal(catalog.items[0].enabled, false);
+  assert.ok(catalog.unavailableWorkspaces.includes(unavailable));
+  const state = await upgraded.store.read();
+  assert.ok(state.workspaces.includes(unavailable));
+  assert.equal(state.migrated.includes(join(unavailable, '.dsh/skills-mcp-groups.json')), false);
+  await assert.rejects(access(unavailable));
+
+  const reopened = new GroupManager(skills, mcp, mcp.profileDir);
+  await reopened.register([]);
+  assert.equal((await reopened.list()).length, 1);
+  assert.deepEqual((await reopened.list())[0].workspaces, [a, unavailable]);
+});
+
+test('save and assign still reject newly selected missing directories without changing group state', async (t) => {
+  const { root, a, manager, entries } = await fixture(t);
+  const x = await entries('strict-target');
+  const group = await manager.save({
+    name: 'strict-target',
+    members: x.members,
+    workspaces: [a],
+  });
+  const unavailable = join(root, 'new-missing-target');
+  const before = await readFile(manager.store.file, 'utf8');
+  await assert.rejects(
+    manager.save({ ...group, workspaces: [a, unavailable] }),
+    /ENOENT|directory|unavailable/i,
+  );
+  await assert.rejects(manager.assign(group.id, [unavailable]), /ENOENT|directory|unavailable/i);
+  assert.equal(await readFile(manager.store.file, 'utf8'), before);
+  await assert.rejects(access(unavailable));
+});
+
+test('catalog treats non-directory path components as unavailable workspaces', async (t) => {
+  const { root, a, manager } = await fixture(t);
+  const file = join(root, 'regular-file');
+  await writeFile(file, 'not a directory');
+  const invalid = join(file, 'child');
+  const catalog = await manager.catalog([a, invalid]);
+  assert.equal(catalog.workspaceRoots[a], a);
+  assert.equal(catalog.workspaceRoots[invalid], undefined);
+  assert.ok(catalog.unavailableWorkspaces.includes(invalid));
+  assert.equal(await readFile(file, 'utf8'), 'not a directory');
+});
+
+test('more than 128 historical workspaces do not block catalog, list, or group removal', async (t) => {
+  const { root, a, manager } = await fixture(t);
+  const group = await manager.save({ name: 'many-history', members: [], workspaces: [a] });
+  const historical = Array.from({ length: 129 }, (_, index) => join(root, 'offline-' + index));
+  await manager.store.update((data) => {
+    data.workspaces.push(...historical);
+  });
+  const before = await manager.store.read();
+
+  const catalog = await manager.catalog([a]);
+  assert.equal(catalog.workspaceRoots[a], a);
+  assert.deepEqual(new Set(catalog.unavailableWorkspaces), new Set(historical));
+  assert.deepEqual(
+    (await manager.list()).map((item) => item.id),
+    [group.id],
+  );
+  assert.deepEqual(await manager.store.read(), before);
+  await manager.remove(group.id);
+  const after = await manager.store.read();
+  assert.deepEqual(after.groups, []);
+  assert.deepEqual(after.workspaces, before.workspaces);
+  assert.deepEqual(after.migrated, before.migrated);
+  await assert.rejects(access(historical[0]));
+});
+
+test('unavailable workspace member sources leave the catalog repairable and unrelated groups active', async (t) => {
+  for (const kind of ['mcp', 'skill'] as const) {
+    await t.test(kind, async (t) => {
+      const { root, a, b, manager, skills, mcp, agents, local, entries } = await fixture(t);
+      const healthy = await entries('independent-source');
+      const good = await manager.save({
+        name: 'independent-source',
+        members: healthy.members,
+        workspaces: [a],
+      });
+      await manager.toggle(good.id, true);
+
+      let members: GroupMember[];
+      if (kind === 'mcp') {
+        await mcp.save({ name: 'offline-source', command: 'offline-source' }, undefined, {
+          scope: 'workspace',
+          cwd: b,
+        });
+        members = [{ kind: 'mcp', name: 'offline-source', cwd: b }];
+      } else {
+        const source = local(b, 'offline-source');
+        await mkdir(dirnameFor(source), { recursive: true });
+        await writeFile(
+          source,
+          '---\nname: offline-source\ndescription: offline source\n---\nBody.\n',
+        );
+        members = [{ kind: 'skill', path: source }];
+      }
+      const bad = await manager.save({ name: 'offline-source', members, workspaces: [a] });
+      const removable = await manager.save({ name: 'offline-removable', members, workspaces: [a] });
+      await manager.toggle(bad.id, true);
+      await manager.toggle(removable.id, true);
+      const before = (await manager.store.read()).groups;
+      const held = join(root, 'held-source');
+      await rename(b, held);
+
+      const reopened = new GroupManager(skills, mcp, mcp.profileDir);
+      const catalog = await reopened.catalog([a, b]);
+      const summary = catalog.items.find((group) => group.id === bad.id)!;
+      assert.equal(summary.enabled, true);
+      assert.ok(summary.missing > 0);
+      assert.deepEqual((await reopened.store.read()).groups, before);
+      assert.deepEqual(
+        (await mcp.effective(a)).map((server) => server.name),
+        ['independent-source'],
+      );
+      assert.equal(agents[0].tools.has('mcp__independent-source__echo'), true);
+      assert.equal(agents[0].tools.has('mcp__offline-source__echo'), false);
+      assert.equal((await skills.read(local(a, 'independent-source'), a)).modelEnabled, true);
+      if (kind === 'skill') {
+        const deployed = await skills.read(local(a, 'offline-source'), a);
+        assert.equal(deployed.modelEnabled, false);
+        assert.equal(deployed.userEnabled, false);
+      }
+      await assert.rejects(reopened.toggle(bad.id, true), /unavailable|missing/i);
+      await reopened.toggle(bad.id, false);
+      await reopened.remove(removable.id);
+      assert.equal(
+        (await reopened.list()).some((group) => group.id === removable.id),
+        false,
+      );
+      assert.equal((await reopened.list()).find((group) => group.id === bad.id)?.enabled, false);
+      assert.equal(agents[0].tools.has('mcp__independent-source__echo'), true);
+      await assert.rejects(access(b));
+
+      await rename(held, b);
+      await reopened.catalog([a, b]);
+      await reopened.toggle(bad.id, true);
+      if (kind === 'mcp') {
+        assert.equal(agents[0].tools.has('mcp__offline-source__echo'), true);
+      } else {
+        const deployed = await skills.read(local(a, 'offline-source'), a);
+        assert.equal(deployed.modelEnabled, true);
+        assert.equal(deployed.userEnabled, true);
+      }
+      assert.equal(agents[0].tools.has('mcp__independent-source__echo'), true);
+    });
+  }
+});
+
+test('unavailable workspace tolerance never hides corrupt MCP or legacy group JSON', async (t) => {
+  for (const kind of ['mcp', 'legacy'] as const) {
+    await t.test(kind, async (t) => {
+      const { a, b, c, manager, skills, mcp } = await fixture(t);
+      const file = join(
+        b,
+        kind === 'mcp' ? '.dsh/skills-mcp-universal.json' : '.dsh/skills-mcp-groups.json',
+      );
+      await mkdir(dirnameFor(file), { recursive: true });
+      const raw = '{invalid JSON';
+      await writeFile(file, raw);
+      if (kind === 'legacy') {
+        await manager.store.update((data) => {
+          data.migrated = data.migrated.filter((path) => path !== file);
+        });
+      }
+      await rm(c, { recursive: true });
+      const reopened = new GroupManager(skills, mcp, mcp.profileDir);
+      await assert.rejects(reopened.catalog([a, c]), /JSON|property name|Unexpected/i);
+      assert.equal(await readFile(file, 'utf8'), raw);
+      await assert.rejects(access(c));
+    });
+  }
 });

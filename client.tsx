@@ -42,6 +42,8 @@ window.__ModuleLoader__.load({
       groupWorkspaces: '工作区',
       chooseWorkspace: '选择一个或多个工作区',
       noRegisteredWorkspaces: '请先在 Harness 中添加工作区',
+      unavailableWorkspaces: '工作区不可用，已跳过：',
+      unavailableWorkspace: '不可用',
       newGroup: '新建分组',
       editGroup: '编辑分组',
       groupName: '分组名称',
@@ -106,6 +108,8 @@ window.__ModuleLoader__.load({
       groupWorkspaces: 'Workspaces',
       chooseWorkspace: 'Select one or more workspaces',
       noRegisteredWorkspaces: 'Add a workspace in Harness first',
+      unavailableWorkspaces: 'Unavailable workspaces skipped:',
+      unavailableWorkspace: 'Unavailable',
       newGroup: 'New group',
       editGroup: 'Edit group',
       groupName: 'Group name',
@@ -269,8 +273,11 @@ window.__ModuleLoader__.load({
               ]),
             ).values(),
           ];
+          const unavailable = (path: string) =>
+            workspaces.some((item) => item.path === path && item.unavailable);
           const title = (path: string) =>
-            workspaces.find((item) => item.path === path)?.title || path;
+            (workspaces.find((item) => item.path === path)?.title || path) +
+            (unavailable(path) ? ` (${t('unavailableWorkspace')})` : '');
           return h(Menu, {
             open,
             portal: true,
@@ -281,12 +288,15 @@ window.__ModuleLoader__.load({
             items: choices.map((workspace) => ({
               id: workspace.path,
               label: title(workspace.path),
-              disabled,
+              disabled:
+                disabled || (unavailable(workspace.path) && !value.includes(workspace.path)),
             })),
-            onSelect: (path) =>
+            onSelect: (path) => {
+              if (disabled || (unavailable(path) && !value.includes(path))) return;
               onChange(
                 value.includes(path) ? value.filter((item) => item !== path) : [...value, path],
-              ),
+              );
+            },
             onClose: () => setOpen(false),
             anchor: h(
               Button,
@@ -740,10 +750,17 @@ window.__ModuleLoader__.load({
           useLocale();
           const registeredWorkspaces = useWorkspaces();
           const [workspaceRoots, setWorkspaceRoots] = useState<Record<string, string>>({});
-          const workspaces = registeredWorkspaces.map((item) => ({
+          const [unavailableWorkspaces, setUnavailableWorkspaces] = useState<string[]>([]);
+          const workspaces: Workspace[] = registeredWorkspaces.map((item) => ({
             ...item,
             path: workspaceRoots[item.path] ?? item.path,
+            unavailable:
+              unavailableWorkspaces.includes(item.path) ||
+              unavailableWorkspaces.includes(workspaceRoots[item.path]),
           }));
+          for (const path of unavailableWorkspaces)
+            if (!workspaces.some((item) => item.path === path))
+              workspaces.push({ path, unavailable: true });
           const workspaceKey = registeredWorkspaces.map((item) => item.path).join('\n');
           const [tab, setTab] = useState('groups');
           const [search, setSearch] = useState('');
@@ -804,6 +821,7 @@ window.__ModuleLoader__.load({
               if (signal?.aborted) return;
               setGroups(nextGroups.items);
               setWorkspaceRoots(nextGroups.workspaceRoots);
+              setUnavailableWorkspaces(nextGroups.unavailableWorkspaces);
               setItems(skills);
               setServers(mcp);
             },
@@ -925,6 +943,12 @@ window.__ModuleLoader__.load({
                   className: 'notice' + (notice.error ? ' error' : ''),
                 },
                 notice.text,
+              ),
+            unavailableWorkspaces.length > 0 &&
+              h(
+                'p',
+                { role: 'status', className: 'notice' },
+                `${t('unavailableWorkspaces')}\n${unavailableWorkspaces.join('\n')}`,
               ),
             tab === 'groups'
               ? h(

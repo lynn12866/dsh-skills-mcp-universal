@@ -45,6 +45,7 @@ export interface NativeUI {
 export interface Workspace {
   path: string;
   title?: string;
+  unavailable?: boolean;
 }
 export interface ClientContext {
   effect(setup: () => (() => unknown) | void, label?: string): void;

@@ -1,6 +1,6 @@
 {
   "name": "dsh-skills-mcp-universal",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Skills and MCP management for DeepSeek Harness Web and Desktop",
   "type": "module",
   "license": "MIT",

@@ -17,7 +17,8 @@ export async function workspaceRoot(cwd: string) {
   if (typeof cwd !== 'string' || !isAbsolute(cwd))
     throw new Error('Select an absolute workspace directory.');
   const path = await realpath(cwd);
-  if (!(await stat(path)).isDirectory()) throw new Error('Workspace must be a directory.');
+  if (!(await stat(path)).isDirectory())
+    throw Object.assign(new Error('Workspace must be a directory.'), { code: 'ENOTDIR' });
   return projectRoot(path);
 }
 

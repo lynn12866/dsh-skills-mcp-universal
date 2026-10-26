@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, rm, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { Groups } from './groups.js';
 import { Skills, skillFingerprint } from './skills.js';
 import { ScopedMcp, workspaceRoot } from './scopes.js';
@@ -24,6 +24,8 @@ export const groupMemberKey = (member: GroupMember) =>
 
 type SkillSource = { item: SkillItem; manager: Skills; cwd?: string };
 type Undo = () => Promise<unknown>;
+const unavailable = (error: NodeJS.ErrnoException) =>
+  error.code === 'ENOENT' || error.code === 'ENOTDIR';
 
 /** One library and persistent group switches. Native directories are deployment targets. */
 export class GroupManager {
@@ -31,6 +33,7 @@ export class GroupManager {
   library: Skills;
   private legacy: Groups;
   private initialized = false;
+  private availableWorkspaceKey = '';
 
   constructor(
     private skills: Skills,
@@ -115,7 +118,7 @@ export class GroupManager {
       manager: this.library,
     }));
     sources.push(...(await this.skills.list()).map((item) => ({ item, manager: this.skills })));
-    for (const cwd of data.workspaces) {
+    for (const cwd of await this.available(data.workspaces)) {
       sources.push(
         ...(await this.skills.list(cwd))
           .filter(
@@ -133,12 +136,12 @@ export class GroupManager {
       server,
       cwd: undefined as string | undefined,
     }));
-    for (const cwd of data.workspaces) {
+    for (const cwd of await this.available(data.workspaces)) {
       try {
         const owner = await this.mcp.owner({ scope: 'workspace', cwd });
         result.push(...(await owner.manager.read()).map((server) => ({ server, cwd })));
       } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
+        if (!unavailable(error)) throw error;
       }
     }
     return result;
@@ -180,28 +183,65 @@ export class GroupManager {
     return { sources: canonical, aliases };
   }
 
+  private async resolveWorkspaces(paths: string[], allowUnavailable = false) {
+    if (!Array.isArray(paths)) throw new Error('Select up to 128 workspace directories.');
+    const roots: Record<string, string> = {};
+    const unavailableWorkspaces: string[] = [];
+    for (const path of paths) {
+      let root: string;
+      try {
+        root = await workspaceRoot(path);
+      } catch (error) {
+        if (!allowUnavailable || !unavailable(error)) throw error;
+        unavailableWorkspaces.push(path);
+        continue;
+      }
+      if (
+        [this.skills.home, this.skills.agentsHome, this.mcp.profileDir, this.library.home].includes(
+          root,
+        )
+      )
+        throw new Error('Select a workspace directory.');
+      roots[path] = root;
+    }
+    return { roots, unavailableWorkspaces };
+  }
+
   private async canonical(paths: string[]) {
-    if (!Array.isArray(paths) || paths.length > 128)
-      throw new Error('Select up to 128 workspace directories.');
-    return [
-      ...new Set(
-        await Promise.all(
-          paths.map(async (path) => {
-            const root = await workspaceRoot(path);
-            if (
-              [
-                this.skills.home,
-                this.skills.agentsHome,
-                this.mcp.profileDir,
-                this.library.home,
-              ].includes(root)
-            )
-              throw new Error('Select a workspace directory.');
-            return root;
-          }),
+    if (paths?.length > 128) throw new Error('Select up to 128 workspace directories.');
+    return [...new Set(Object.values((await this.resolveWorkspaces(paths)).roots))];
+  }
+
+  private async available(paths: string[]) {
+    return Object.keys((await this.resolveWorkspaces(paths, true)).roots);
+  }
+
+  private async availableGroups(data: GroupState) {
+    const { unavailableWorkspaces } = await this.resolveWorkspaces(
+      [
+        ...new Set([
+          ...data.workspaces,
+          ...data.groups.flatMap((group) =>
+            group.members.flatMap((member) =>
+              member.kind === 'mcp' && member.cwd ? [member.cwd] : [],
+            ),
+          ),
+        ]),
+      ],
+      true,
+    );
+    return data.groups.filter(
+      (group) =>
+        !group.members.some((member) =>
+          member.kind === 'mcp'
+            ? !!member.cwd && unavailableWorkspaces.includes(member.cwd)
+            : unavailableWorkspaces.some((cwd) =>
+                [join(cwd, '.dsh/skills'), join(cwd, '.agents/skills')].some((root) =>
+                  member.path.startsWith(root + sep),
+                ),
+              ),
         ),
-      ),
-    ];
+    );
   }
 
   private async transaction<T>(update: (data: GroupState, undo: Undo[]) => Promise<T>) {
@@ -239,9 +279,18 @@ export class GroupManager {
   }
 
   async register(paths: string[]) {
-    const roots = await this.canonical(paths);
+    if (paths?.length > 128) throw new Error('Select up to 128 workspace directories.');
+    const roots = [...new Set(Object.values((await this.resolveWorkspaces(paths, true)).roots))];
     const current = await this.read();
-    if (this.initialized && roots.every((root) => current.workspaces.includes(root))) return;
+    const availableWorkspaceKey = JSON.stringify(
+      await this.available([...new Set([...current.workspaces, ...roots])]),
+    );
+    if (
+      this.initialized &&
+      roots.every((root) => current.workspaces.includes(root)) &&
+      this.availableWorkspaceKey === availableWorkspaceKey
+    )
+      return;
     await this.transaction(async (data) => {
       data.workspaces = [...new Set([...data.workspaces, ...roots])];
       const assignments = await new JsonStore<SceneAssignmentData>(
@@ -250,7 +299,9 @@ export class GroupManager {
       ).read();
       if (assignments.version !== 1 || !Array.isArray(assignments.entries))
         throw new Error('Corrupt previous group assignments were preserved.');
-      for (const cwd of [undefined, ...data.workspaces]) {
+      // A stale Host registry entry must not block the library or be recreated.
+      // Leave its migration pending so restoring the directory can retry it.
+      for (const cwd of [undefined, ...(await this.available(data.workspaces))]) {
         const options = cwd ? { scope: 'workspace' as const, cwd } : {};
         const store = await this.legacy.owner(options);
         if (data.migrated.includes(store.file)) continue;
@@ -261,7 +312,9 @@ export class GroupManager {
               entry.scope === (cwd ? 'workspace' : 'global') &&
               entry.cwd === cwd,
           );
-          const workspaces = await this.canonical(assignment?.workspaces ?? (cwd ? [cwd] : []));
+          const targets = assignment?.workspaces ?? (cwd ? [cwd] : []);
+          const resolved = await this.resolveWorkspaces(targets, true);
+          const workspaces = [...new Set(targets.map((path) => resolved.roots[path] ?? path))];
           data.workspaces = [...new Set([...data.workspaces, ...workspaces])];
           let name = group.name;
           for (let suffix = 2; data.groups.some((item) => item.name === name); suffix++)
@@ -282,6 +335,7 @@ export class GroupManager {
         data.migrated.push(store.file);
       }
     });
+    this.availableWorkspaceKey = availableWorkspaceKey;
   }
 
   async list(): Promise<ManagedGroupSummary[]> {
@@ -302,11 +356,14 @@ export class GroupManager {
 
   async catalog(paths: string[]) {
     await this.register(paths);
+    const resolved = await this.resolveWorkspaces(paths, true);
+    const historical = await this.resolveWorkspaces((await this.read()).workspaces, true);
     return {
       items: await this.list(),
-      workspaceRoots: Object.fromEntries(
-        await Promise.all(paths.map(async (path) => [path, await workspaceRoot(path)] as const)),
-      ),
+      workspaceRoots: resolved.roots,
+      unavailableWorkspaces: [
+        ...new Set([...resolved.unavailableWorkspaces, ...historical.unavailableWorkspaces]),
+      ],
     };
   }
 
@@ -365,6 +422,8 @@ export class GroupManager {
       if (!group) throw new Error('Group no longer exists.');
       if (enabled && (!group.members.length || !group.workspaces.length))
         throw new Error('Select members and at least one workspace before enabling the group.');
+      if (enabled && !(await this.availableGroups(data)).some((item) => item.id === id))
+        throw new Error('A group member workspace is unavailable. Restore it or edit the group.');
       group.enabled = enabled;
       return group;
     });
@@ -386,7 +445,7 @@ export class GroupManager {
 
   private async serversFor(data: GroupState, workspace: string): Promise<ScopedServer[]> {
     const servers = new Map<string, ScopedServer>();
-    for (const group of data.groups.filter(
+    for (const group of (await this.availableGroups(data)).filter(
       (group) => group.enabled && group.workspaces.includes(workspace),
     )) {
       for (const member of group.members) {
@@ -409,12 +468,16 @@ export class GroupManager {
 
   private async syncSkills(data: GroupState, undo: Undo[]) {
     const sources = await this.sources(data);
+    const groups = await this.availableGroups(data);
+    const availableWorkspaces = new Set(await this.available(data.workspaces));
     for (const cwd of new Set(
-      data.groups.filter((group) => group.enabled).flatMap((group) => group.workspaces),
+      groups.filter((group) => group.enabled).flatMap((group) => group.workspaces),
     ))
-      await this.serversFor(data, cwd);
+      if (availableWorkspaces.has(cwd)) await this.serversFor(data, cwd);
     // Validate enabled MCP references before publishing any Skill flags.
-    for (const group of data.groups.filter((group) => group.enabled)) {
+    for (const group of groups.filter(
+      (group) => group.enabled && group.workspaces.some((cwd) => availableWorkspaces.has(cwd)),
+    )) {
       for (const member of group.members) {
         if (member.kind === 'mcp')
           await this.mcp.get(
@@ -456,10 +519,10 @@ export class GroupManager {
     };
     await apply(this.library, undefined, await this.library.list(), new Set());
     await apply(this.skills, undefined, await this.skills.list(), new Set());
-    for (const cwd of data.workspaces) {
+    for (const cwd of availableWorkspaces) {
       const selected = new Set<string>();
       const names = new Map<string, string>();
-      for (const group of data.groups.filter(
+      for (const group of groups.filter(
         (group) => group.enabled && group.workspaces.includes(cwd),
       )) {
         for (const member of group.members) {

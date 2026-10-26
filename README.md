@@ -1,6 +1,6 @@
 # DeepSeek Harness 技能与 MCP 管理插件
 
-![DeepSeek Harness](https://img.shields.io/badge/DeepSeek_Harness-0.2.1--rc.2-4D6BFE)
+![DeepSeek Harness](https://img.shields.io/badge/DeepSeek_Harness-0.2.1--rc.3-4D6BFE)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)
 ![pnpm](https://img.shields.io/badge/pnpm-11.25-F69220?logo=pnpm&logoColor=white)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.19-339933?logo=nodedotjs&logoColor=white)
@@ -40,10 +40,10 @@ dsh plugin --profile web add dsh-skills-mcp-universal
 ```sh
 # macOS 桌面版：替换为安装包的绝对路径和实际版本
 "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" \
-  plugin --profile desktop add file:/absolute/path/dsh-skills-mcp-universal-0.5.1.tgz
+  plugin --profile desktop add file:/absolute/path/dsh-skills-mcp-universal-0.5.2.tgz
 
 # Web 版：将安装包放到服务端，在服务端执行
-dsh plugin --profile web add file:/absolute/path/dsh-skills-mcp-universal-0.5.1.tgz
+dsh plugin --profile web add file:/absolute/path/dsh-skills-mcp-universal-0.5.2.tgz
 ```
 
 安装或更新后重启应用 / Web 服务。覆盖升级时在命令末尾添加 `--force`，原有配置保留；自定义 profile 请替换 `desktop` 或 `web`。
@@ -52,6 +52,7 @@ dsh plugin --profile web add file:/absolute/path/dsh-skills-mcp-universal-0.5.1.
 
 - **导入后默认不可调用。** 需创建分组、选择工作区并开启；旧配置迁移后的分组也需手动开启。删除分组保留原条目。
 - 开关仅控制本插件管理的条目；关闭 Skill 不会撤回已进入历史对话的正文。
+- 已删除或暂不可用的工作区会显示提示并跳过，保留分组与分配；目录恢复后自动重试同步。
 - MCP 凭据保存在本地配置文件中；stdio 所需程序与依赖须自行安装。不支持旧版 SSE 传输和 MCP OAuth 登录。
 - 不支持技能包内的符号链接或第三方桌面壳；Windows Desktop 尚未实机验证。实测范围见 [验证记录](./VALIDATION.md)。
 
